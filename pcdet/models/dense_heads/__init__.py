@@ -4,7 +4,7 @@ from .anchor_head_template import AnchorHeadTemplate
 from .point_head_box import PointHeadBox
 from .point_head_simple import PointHeadSimple
 from .point_intra_part_head import PointIntraPartOffsetHead
-from .center_head import CenterHead
+from .center_head import CenterHead, CenterHeadRoI
 from .voxelnext_head import VoxelNeXtHead
 from .transfusion_head import TransFusionHead
 
@@ -18,4 +18,5 @@ __all__ = {
     'CenterHead': CenterHead,
     'VoxelNeXtHead': VoxelNeXtHead,
     'TransFusionHead': TransFusionHead,
+    'CenterHeadRoI': CenterHeadRoI,
 }

@@ -3,7 +3,7 @@ from .. import backbones_image, view_transforms
 from ..backbones_image import img_neck
 from ..backbones_2d import fuser
 
-class BevFusion(Detector3DTemplate):
+class ContrastAlign(Detector3DTemplate):
     def __init__(self, model_cfg, num_class, dataset):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
         self.module_topology = [
@@ -73,6 +73,9 @@ class BevFusion(Detector3DTemplate):
 
     def get_training_loss(self,batch_dict):
         disp_dict = {}
+
+        # loss_trans, con_loss, tb_dict = batch_dict['loss'], batch_dict['con_loss'], batch_dict['tb_dict']
+        # loss_trans = loss_trans + 0.1*con_loss
 
         loss_trans, tb_dict = batch_dict['loss'],batch_dict['tb_dict']
         tb_dict = {

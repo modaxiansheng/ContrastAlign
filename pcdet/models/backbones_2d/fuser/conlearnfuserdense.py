@@ -1,13 +1,32 @@
-import copy
-import numpy as np
 import torch
-import torch.nn as nn
+import numpy as np
+from torch import nn
 from torch.nn.init import kaiming_normal_
-from ..model_utils import model_nms_utils
-from ..model_utils import centernet_utils
-from ...utils import loss_utils
+from ...model_utils import centernet_utils
+from ...model_utils import model_nms_utils
+from ....utils import loss_utils
+from ....utils.spconv_utils import replace_feature, spconv
+import copy
+from easydict import EasyDict
+from spconv.core import ConvAlgo
+import torchvision
+import torchvision.ops as ops
+from ... import dense_heads
 from functools import partial
+def build_dense_head(model_cfg):
+    dense_head_module = dense_heads.__all__[model_cfg.NAME](
+        model_cfg = model_cfg,
+        input_channels = model_cfg.IN_CHANNEL,
+        num_class = 10 if not model_cfg.CLASS_AGNOSTIC else 1, # for nus
+        class_names = ['car','truck', 'construction_vehicle', 'bus', 'trailer',\
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'],
+        grid_size = None,
+        point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
+        predict_boxes_when_training = True,
+        voxel_size = [0.075, 0.075, 0.2]
+    )
 
+    return dense_head_module
 
 class SeparateHead(nn.Module):
     def __init__(self, input_channels, sep_head_dict, init_bias=-2.19, use_bias=False, norm_func=None):
@@ -414,15 +433,16 @@ class CenterHead(nn.Module):
         return data_dict
 
 
-class CenterHeadRoI(CenterHead):
+class LidarCenterHeadRoI(CenterHead):
     def __init__(self, model_cfg, input_channels, num_class, class_names, grid_size, point_cloud_range, voxel_size,
                  predict_boxes_when_training = True):
         super().__init__(model_cfg, input_channels, num_class, class_names, grid_size, point_cloud_range, voxel_size,
                  predict_boxes_when_training)
         self.pc_start = model_cfg.PC_START
         self.out_stride = model_cfg.OUT_STRIDE
+    
     def forward(self, data_dict):
-        spatial_features_2d = data_dict['spatial_features_img']
+        spatial_features_2d = data_dict['spatial_features']
         x = self.shared_conv(spatial_features_2d)
 
         pred_dicts = []
@@ -447,14 +467,15 @@ class CenterHeadRoI(CenterHead):
             )
 
             #if self.predict_boxes_when_training:
-                #targets_dict = self.centerpoint_roi_pool(pred_dicts, spatial_features_2d)
+                #targets_dict_other = self.centerpoint_roi_pool(pred_dicts, spatial_features_2d)
+                #targets_dict_train = self.centerpoint_roi_pool(data_dict, spatial_features_2d, training = True)
                 # rois, roi_scores, roi_labels = self.reorder_rois_for_refining(data_dict['batch_size'], pred_dicts)
                 # targets_dict['rois'] = rois
                 # targets_dict['roi_scores'] = roi_scores
                 # targets_dict['roi_labels'] = roi_labels
                 # targets_dict['has_class_labels'] = True
             #else:
-                #targets_dict['final_box_dicts'] = pred_dicts
+                #targets_dict_other['final_box_dicts'] = pred_dicts
 
         return data_dict, targets_dict_con
     
@@ -490,10 +511,8 @@ class CenterHeadRoI(CenterHead):
                 points = torch.cat([box[:, :3], front_middle, back_middle, left_middle, \
                     right_middle], dim=0) # 5个点
                 centers.append(points)
-
             else:
                 raise NotImplementedError()
-            
         
         return centers
 
@@ -571,7 +590,7 @@ class CenterHeadRoI(CenterHead):
 
 
 
-    def centerpoint_roi_pool(self, ret_dict, bev_feature, training=False):
+    def centerpoint_roi_pool(self, ret_dict, bev_feature, training = False):
         
         if self.training:
             batch_centers = self.get_box_center(boxes = ret_dict, training = True) # type(ret_dict) should not be list 
@@ -702,3 +721,167 @@ def bilinear_interpolate_torch(im, x, y):
     wd = (x - x0.type_as(x)) * (y - y0.type_as(y))
     ans = torch.t((torch.t(Ia) * wa)) + torch.t(torch.t(Ib) * wb) + torch.t(torch.t(Ic) * wc) + torch.t(torch.t(Id) * wd)
     return ans
+
+class ConleanFuserDense(nn.Module):
+    def __init__(self,model_cfg) -> None:
+        super().__init__()
+        self.model_cfg = model_cfg
+        in_channel = self.model_cfg.IN_CHANNEL
+        out_channel = self.model_cfg.OUT_CHANNEL
+        self.model_cfg.IMG_HEAD.IN_CHANNEL = 128
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channel, out_channel, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(True)
+            )
+        # self.img_box_net = ImgRoIHead() # 所有参数都有默认, 最后的大小取决于output_size, 默认7*7 # feiyang version
+        # self.img_box_net = SeclectBox(model_cfg=self.model_cfg) # guoxin version
+        if self.training:
+            self.img_box_net = build_dense_head(self.model_cfg.IMG_HEAD) # guoxin  v2 # build center_head_roi
+            # self.lidar_box_net = SeclectBox(model_cfg = self.model_cfg)
+            self.lidar_box_net = LidarCenterHeadRoI(model_cfg = self.model_cfg.LIDAR_HEAD, 
+                                                      input_channels = 128, 
+                                                      num_class = 10, 
+                                                      class_names =  ['car','truck', 'construction_vehicle', 'bus', 'trailer','barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'], 
+                                                      grid_size = None, 
+                                                      point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0],
+                                                      predict_boxes_when_training = True, 
+                                                      voxel_size = [0.075, 0.075, 0.2])
+        self.point_cloud_range = torch.Tensor([-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]).cuda()
+
+
+    def shoot(self, lidar_targets_dict,camera_targets_dict,threshol = 0.1, kd_tree_neigbbor=8):
+        '''
+        lidar_targets_dict: ['rois'] ['roi_labels'] ['roi_scores'] ['roi_features'] ['has_class_labels']
+            ['rois']: [bs, n, 9], 9分别是x, y, z, w, l, h, rotation_y, velocity_x, velocity_y
+            ['roi_labels']: [bs, n], cls id
+            ['roi_scores']: [bs, n], 0-1评分, 从大到小排序
+            ['roi_features']: [bs, n, 5*c], c是128
+            ['has_class_labels']: True
+        camera_targets_dict: 相同, 第二维m接近500, 一般都大于n
+        '''
+        
+        from ....ops.iou3d_nms.iou3d_nms_utils import boxes_iou3d_gpu,boxes_iou_bev
+        from scipy.spatial import cKDTree
+        lidar_roi_box=lidar_targets_dict['rois']
+        camera_roi_box=camera_targets_dict['rois']
+        assert lidar_roi_box.shape[0]==camera_roi_box.shape[0]
+        assert lidar_roi_box.shape[-1]==camera_roi_box.shape[-1]
+        batch_size=lidar_roi_box.shape[0]
+        device=lidar_roi_box.device
+        ### 根据iou获得相近的box
+        shoot_indices=[]
+        for i in range(batch_size):
+            ### boxes_iou3d_gpu 命中的极少 不对 
+            # rets.append(boxes_iou3d_gpu(lidar_roi_box[i][:, 0:7], camera_roi_box[i][:, 0:7])) 
+            ### boxes_iou_bev 命中的数量跟lidar的数量基本一致 但是计算出来的值不是0-1的 
+            ### img=498 lidar=155 (rets1[0]>0.999999).sum()=tensor(155, device='cuda:0')
+            ### img=498 lidar=157 (rets1[0]>0.999999).sum()=tensor(117, device='cuda:0')
+            ret=boxes_iou_bev(lidar_roi_box[i][:, 0:7], camera_roi_box[i][:, 0:7])
+            indices = torch.nonzero(ret > threshol)
+            if indices.size(0) == 0:
+                indices = torch.nonzero(ret > 0)
+            else:
+                pass
+            # import pdb;pdb.set_trace()
+            result = torch.zeros(indices.size(0), 3)
+            result[:, 0] = indices[:, 0]
+            result[:, 1] = indices[:, 1]
+            result[:, 2] = ret[indices[:, 0], indices[:, 1]]
+            result,_ = torch.sort(result, dim=0, descending=True) # 按照第三列从大到小排序结果是
+            shoot_indices.append(result.to(device))
+        ### 取出shoot到的box
+        # 发现shoot_indices有为空的情况
+        rois_shoot=[]
+        roi_labels_shoot=[]
+        roi_scores_shoot=[]
+        roi_features_shoot=[]
+        roi_features_neighbor=[]
+        for i in range(batch_size):
+            
+            shoot_indice_l=shoot_indices[i][:, 0].int()
+            shoot_indice_c=shoot_indices[i][:, 1].int()
+            # print(i,shoot_indice_l,shoot_indice_c)
+            rois_shoot.append(torch.index_select(lidar_targets_dict['rois'][i],0,shoot_indice_l).to(device))
+            rois_shoot.append(torch.index_select(camera_targets_dict['rois'][i],0,shoot_indice_c).to(device))
+            roi_labels_shoot.append(torch.index_select(lidar_targets_dict['roi_labels'][i],0,shoot_indice_l).to(device))
+            roi_labels_shoot.append(torch.index_select(camera_targets_dict['roi_labels'][i],0,shoot_indice_c).to(device))
+            roi_scores_shoot.append(torch.index_select(lidar_targets_dict['roi_scores'][i],0,shoot_indice_l).to(device))
+            roi_scores_shoot.append(torch.index_select(camera_targets_dict['roi_scores'][i],0,shoot_indice_c).to(device))
+            roi_features_shoot.append(torch.index_select(lidar_targets_dict['roi_features'][i],0,shoot_indice_l).to(device))
+            roi_features_shoot.append(torch.index_select(camera_targets_dict['roi_features'][i],0,shoot_indice_c).to(device))
+            kdtree_l = cKDTree(lidar_targets_dict['rois'][i][:,:2].cpu().detach().numpy())
+            kdtree_c = cKDTree(camera_targets_dict['rois'][i][:,:2].cpu().detach().numpy())
+            roi_features_neighbor_l=[]
+            for j in rois_shoot[-2]: #选中lidar 从camera里查找neighbor作为负样本
+                distances, neighbor_indices = kdtree_c.query(j[:2].cpu().detach().numpy(), k=kd_tree_neigbbor+1)
+                roi_features_neighbor_l.append(torch.index_select(camera_targets_dict['roi_features'][i],0,torch.tensor(neighbor_indices).to(device)))
+            if len(roi_features_neighbor_l) == 0:
+                import pdb; pdb.set_trace()
+            roi_features_neighbor.append(torch.stack(roi_features_neighbor_l))
+            roi_features_neighbor_c=[]
+            for j in rois_shoot[-1]:
+                distances, neighbor_indices = kdtree_l.query(j[:2].cpu().detach().numpy(), k=kd_tree_neigbbor+1)
+                roi_features_neighbor_c.append(torch.index_select(lidar_targets_dict['roi_features'][i],0,torch.tensor(neighbor_indices).to(device)))
+            roi_features_neighbor.append(torch.stack(roi_features_neighbor_c))
+        lidar_targets_dict_shoot={}
+        lidar_targets_dict_shoot['rois']=rois_shoot[::2]
+        lidar_targets_dict_shoot['roi_labels']=roi_labels_shoot[::2]
+        lidar_targets_dict_shoot['roi_scores']=roi_scores_shoot[::2]
+        lidar_targets_dict_shoot['roi_features']=roi_features_shoot[::2] #外层list len=bs # 内层tensor [n, 5*c]
+        lidar_targets_dict_shoot['roi_features_kdtree']=roi_features_neighbor[::2] #外层list len=bs 每个tensor的shape[0]不一致 没法tensor # 内层tensor [n,9,5*c]，n个命中，第二维第1个点是命中的点本身，其他8是neighbor
+        lidar_targets_dict_shoot['has_class_labels']= True
+        camera_targets_dict_shoot={}
+        camera_targets_dict_shoot['rois']=rois_shoot[1::2]
+        camera_targets_dict_shoot['roi_labels']=roi_labels_shoot[1::2]
+        camera_targets_dict_shoot['roi_scores']=roi_scores_shoot[1::2]
+        camera_targets_dict_shoot['roi_features']=roi_features_shoot[1::2]
+        camera_targets_dict_shoot['roi_features_kdtree']=roi_features_neighbor[1::2]
+        camera_targets_dict_shoot['has_class_labels']= True
+        
+        return lidar_targets_dict_shoot,camera_targets_dict_shoot
+
+    def train_shoot(self, batch_dict):
+        pass
+
+    def forward(self, batch_dict):
+        """
+        Args:
+            batch_dict:
+                spatial_features_img (tensor): Bev features from image modality
+                spatial_features (tensor): Bev features from lidar modality
+                encoded_spconv_tensor: 
+        Returns:
+            batch_dict:
+                spatial_features (tensor): Bev features after multi-modal fusion
+        """
+        img_bev = batch_dict['spatial_features_img'] #[1, 80, 180, 180] (b, c, y, x)
+        lidar_bev = batch_dict['spatial_features'] #[1, 128, 180, 180]
+        #x = batch_dict['encoded_spconv_tensor'] # lidar branch 2d
+        #import pdb;pdb.set_trace()
+        #if self.training:
+        batch_dict, lidar_targets_dict = self.lidar_box_net(batch_dict)
+        batch_dict, camera_targets_dict = self.img_box_net(batch_dict)
+        #import pdb;pdb.set_trace()
+        #else:
+           # batch_dict, lidar_targets_dict = self.lidar_box_net(batch_dict)
+        #batch_dict, lidar_targets_dict = self.lidar_box_net(batch_dict) # x: sparse; lidar_bev: dense
+        #import pdb;pdb.set_trace()
+        # batch_dict['img_box'], batch_dict['img_box_indices'] = self.img_box_net(img_bev) # feiyang version
+        #batch_dict, camera_targets_dict = self.img_box_net(batch_dict) # guoxin version
+        # lidar_targets_dict camera_targets_dict
+        
+
+        # 对比学习
+        if self.training:
+            batch_dict['con_loss'] = loss_utils.InfoNCE_conloss(lidar_targets_dict,camera_targets_dict)
+            #import pdb;pdb.set_trace()
+            lidar_pred_loss, _ = self.lidar_box_net.get_loss()
+        #import pdb;pdb.set_trace()
+            img_pred_loss, _ = self.img_box_net.get_loss()
+            batch_dict['con_loss'] = batch_dict['con_loss'] + lidar_pred_loss + img_pred_loss
+
+        cat_bev = torch.cat([img_bev, lidar_bev],dim=1)
+        mm_bev = self.conv(cat_bev)
+        batch_dict['spatial_features'] = mm_bev
+        return batch_dict

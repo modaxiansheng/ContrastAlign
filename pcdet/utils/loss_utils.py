@@ -647,3 +647,59 @@ def calculate_iou_reg_loss_centerhead(batch_box_preds, mask, ind, gt_boxes):
 
     loss = (1.0 - iou).sum() / torch.clamp(mask.sum(), min=1e-4)
     return loss
+
+
+def InfoNCE_loss_single_point(source, target_posi, target_nega):
+    """
+    计算 InfoNCE loss
+
+    Args:
+    - source: 表示源特征向量的张量，形状为 [1, n]
+    - target_posi: 表示正目标特征向量的张量，形状为 [1, n]
+    - target_nega: 表示负目标特征向量的张量，形状为 [8, n]
+
+    Returns:
+    - loss: InfoNCE loss
+    """
+    # 计算余弦相似度
+    source_normalized = F.normalize(source, p=2, dim=1)
+    target_posi_normalized = F.normalize(target_posi, p=2, dim=1)
+    target_nega_normalized = F.normalize(target_nega, p=2, dim=1)
+    
+    sim_pos = torch.cosine_similarity(source_normalized, target_posi_normalized)
+    sim_neg = torch.cosine_similarity(source_normalized.unsqueeze(1), target_nega_normalized, dim=2)
+    
+    # 计算 InfoNCE loss
+    logits = torch.cat([sim_pos.unsqueeze(1), sim_neg], dim=1)
+    labels = torch.zeros(logits.size(0), dtype=torch.long).to(logits.device)
+    loss = F.cross_entropy(logits, labels)
+    
+    return loss
+
+def InfoNCE_loss(lidar_targets_dict_shoot,camera_targets_dict_shoot):
+    assert len(lidar_targets_dict_shoot)==len(camera_targets_dict_shoot)
+    batch_size=len(lidar_targets_dict_shoot['rois'])
+    loss_all=[]
+    for i in range(batch_size):
+        #import pdb;pdb.set_trace()
+        if lidar_targets_dict_shoot['roi_features'][i].shape[0]==0:
+            # 有些batch命中的点的数量是0
+            loss_all.append(torch.tensor([0.]).to(lidar_targets_dict_shoot['roi_features'][i].device))
+            continue
+        for j in range(lidar_targets_dict_shoot['roi_features'][i].shape[0]):
+            #import pdb;pdb.set_trace()
+            loss_all.append(InfoNCE_loss_single_point(source=lidar_targets_dict_shoot['roi_features'][i][j].unsqueeze(0),target_posi=camera_targets_dict_shoot['roi_features'][i][j].unsqueeze(0),target_nega=lidar_targets_dict_shoot['roi_features_kdtree'][0][0]))
+    #import pdb;pdb.set_trace()
+    return torch.stack(loss_all).mean()
+
+def InfoNCE_conloss(lidar_targets_dict_shoot,camera_targets_dict_shoot):
+    assert len(lidar_targets_dict_shoot)==len(camera_targets_dict_shoot)
+    batch_size=len(lidar_targets_dict_shoot)
+    loss_all=[]
+    for i in range(batch_size):
+        for j in range(lidar_targets_dict_shoot[i].shape[0]):
+            #import pdb;pdb.set_trace()
+            target_nega = torch.cat((lidar_targets_dict_shoot[i][0:j], lidar_targets_dict_shoot[i][j+1:]), dim = 0)
+            loss_all.append(InfoNCE_loss_single_point(source=lidar_targets_dict_shoot[i][j].unsqueeze(0),target_posi=camera_targets_dict_shoot[i][j].unsqueeze(0),target_nega=target_nega))
+    #import pdb;pdb.set_trace()
+    return torch.stack(loss_all).mean()
