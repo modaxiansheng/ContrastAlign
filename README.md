@@ -58,14 +58,14 @@ Overview of our **ContrastAlign** framework. It is noteworthy that, to better pr
 | Method | Modality | NDS⬆️| mAP⬆️ |
 | :---: | :---: | :---: | :---: |
 | BEVfusion-MIT | LC | 71.4 | 68.5 |
-| GraphBEV | LC | 72.5 | 70.3 |
+| ContrastAlign | LC | 72.5 | 70.3 |
 
 * Results on nuScenes **test set**.
 
 | Method | Modality | NDS⬆️| mAP⬆️ 
 | :---: | :---: | :---: | :---: |
-| TransFusion | LC | 72.9 | 70.2 |
-| GraphBEV | LC | 73.8 | 71.8 |
+| BEVfusion-MIT | LC | 72.9 | 70.2 |
+| ContrastAlign | LC | 73.8 | 71.8 |
 
 # Dataset Preparation
 
