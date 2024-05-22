@@ -35,7 +35,7 @@ In the field of 3D object detection tasks, fusing heterogeneous modal (LiDAR and
 # Method
 
 <div align="center">
-  <img src="fig/main2" />
+  <img src="fig/main2.png" />
 </div>
 
 <div align="justify">
